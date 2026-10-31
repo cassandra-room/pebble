@@ -50,6 +50,41 @@ func (m *debugMerger) Finish(includesBase bool) ([]byte, io.Closer, error) {
 	return m.buf, nil, nil
 }
 
+type testIterFilter struct {
+	rules []string
+}
+
+func (f *testIterFilter) Filter(
+	key, value []byte, info base.CompactionFilterRecordInfo,
+) (base.CompactionFilterDecision, []byte, error) {
+	for _, rule := range f.rules {
+		switch {
+		case rule == "keep":
+			return base.CompactionFilterKeep, nil, nil
+		case strings.HasPrefix(rule, "drop:"):
+			target := strings.TrimPrefix(rule, "drop:")
+			if string(value) == target {
+				return base.CompactionFilterDrop, nil, nil
+			}
+		case strings.HasPrefix(rule, "drop-bottommost:"):
+			target := strings.TrimPrefix(rule, "drop-bottommost:")
+			if info.IsBottommostStripe && !info.HasOpenSnapshots && string(value) == target {
+				return base.CompactionFilterDrop, nil, nil
+			}
+		case strings.HasPrefix(rule, "replace:"):
+			spec := strings.TrimPrefix(rule, "replace:")
+			oldSuf, newSuf, ok := strings.Cut(spec, "->")
+			if ok && bytes.HasSuffix(value, []byte(oldSuf)) {
+				replaced := append(bytes.TrimSuffix(slices.Clone(value), []byte(oldSuf)), newSuf...)
+				return base.CompactionFilterReplace, replaced, nil
+			}
+		}
+	}
+	return base.CompactionFilterKeep, nil, nil
+}
+
+func (f *testIterFilter) Close() error { return nil }
+
 func TestCompactionIter(t *testing.T) {
 	var merge base.Merge
 	var kvs []base.InternalKV
@@ -58,6 +93,7 @@ func TestCompactionIter(t *testing.T) {
 	var snapshots Snapshots
 	var elideTombstones bool
 	var isBottommostDataLayer bool
+	var filter base.CompactionFilter
 	var ineffectualSingleDeleteKeys []string
 	var invariantViolationSingleDeleteKeys []string
 	var missizedDeleteInfo []string
@@ -87,6 +123,7 @@ func TestCompactionIter(t *testing.T) {
 			TombstoneElision:      elision,
 			RangeKeyElision:       elision,
 			IsBottommostDataLayer: isBottommostDataLayer,
+			Filter:                filter,
 			IneffectualSingleDeleteCallback: func(userKey []byte) {
 				ineffectualSingleDeleteKeys = append(ineffectualSingleDeleteKeys, string(userKey))
 			},
@@ -173,6 +210,7 @@ func TestCompactionIter(t *testing.T) {
 				snapshots = snapshots[:0]
 				elideTombstones = false
 				isBottommostDataLayer = false
+				filter = nil
 				printSnapshotPinned := false
 				printMissizedDels := false
 				printForceObsolete := false
@@ -195,6 +233,8 @@ func TestCompactionIter(t *testing.T) {
 						if err != nil {
 							return err.Error()
 						}
+					case "filter":
+						filter = &testIterFilter{rules: slices.Clone(arg.Vals)}
 					case "print-snapshot-pinned":
 						printSnapshotPinned = true
 					case "print-missized-dels":

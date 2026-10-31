@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/compact"
+	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
@@ -152,10 +153,13 @@ const (
 	compactionKindRewrite
 	compactionKindIngestedFlushable
 	compactionKindBlobFileRewrite
-	// compactionKindVirtualRewrite must be the last compactionKind.
-	// If a new kind has to be added after VirtualRewrite,
-	// update AllCompactionKindStrings() accordingly.
 	compactionKindVirtualRewrite
+	// compactionKindFilter denotes a compaction triggered by IsFileDue to run
+	// the CompactionFilter on a due file.
+	// compactionKindFilter must be the last compactionKind.
+	// If a new kind has to be added after compactionKindFilter,
+	// update AllCompactionKindStrings() accordingly.
+	compactionKindFilter
 )
 
 func (k compactionKind) String() string {
@@ -184,6 +188,8 @@ func (k compactionKind) String() string {
 		return "blob-file-rewrite"
 	case compactionKindVirtualRewrite:
 		return "virtual-sst-rewrite"
+	case compactionKindFilter:
+		return "filter"
 	}
 	return "?"
 }
@@ -205,11 +211,11 @@ func (k compactionKind) compactingOrFlushing() string {
 // for testing purposes. Used by tool/logs/compaction_test.go to verify the
 // compaction summary tool stays in sync with new compaction types.
 //
-// NOTE: This function iterates up to compactionKindVirtualRewrite. If a new
-// compactionKind is added after VirtualRewrite, update this function accordingly.
+// NOTE: This function iterates up to compactionKindFilter. If a new
+// compactionKind is added after compactionKindFilter, update this function accordingly.
 func AllCompactionKindStrings() map[string]bool {
 	kinds := make(map[string]bool)
-	for k := compactionKindDefault; k <= compactionKindVirtualRewrite; k++ {
+	for k := compactionKindDefault; k <= compactionKindFilter; k++ {
 		kinds[k.String()] = true
 	}
 	return kinds
@@ -360,6 +366,8 @@ type tableCompaction struct {
 	objCreateOpts objstorage.CreateOptions
 
 	annotations []string
+
+	compactionPropertyCollectorName string
 }
 
 // Assert that tableCompaction implements the compaction interface.
@@ -581,14 +589,15 @@ func newCompaction(
 	getValueSeparation getValueSeparation,
 ) *tableCompaction {
 	c := &tableCompaction{
-		ctx:                ctx,
-		kind:               compactionKindDefault,
-		comparer:           opts.Comparer,
-		inputs:             pc.inputs,
-		bounds:             pc.bounds,
-		logger:             opts.Logger,
-		version:            pc.version,
-		getValueSeparation: getValueSeparation,
+		ctx:                             ctx,
+		kind:                            compactionKindDefault,
+		comparer:                        opts.Comparer,
+		inputs:                          pc.inputs,
+		bounds:                          pc.bounds,
+		logger:                          opts.Logger,
+		version:                         pc.version,
+		getValueSeparation:              getValueSeparation,
+		compactionPropertyCollectorName: opts.CompactionPropertyCollectorName,
 		metrics: compactionMetrics{
 			beganAt: beganAt,
 			picker:  pc.pickerMetrics,
@@ -650,7 +659,7 @@ func newCompaction(
 	)
 	c.kind = pc.kind
 
-	c.maybeSwitchToMoveOrCopy(preferSharedStorage, provider)
+	c.maybeSwitchToMoveOrCopy(opts, preferSharedStorage, provider)
 	c.objCreateOpts = objstorage.CreateOptions{
 		PreferSharedStorage: preferSharedStorage,
 		WriteCategory:       getDiskWriteCategoryForCompaction(opts, c.kind),
@@ -665,7 +674,7 @@ func newCompaction(
 // maybeSwitchToMoveOrCopy decides if the compaction can be changed into a move
 // or copy compaction, in which case c.kind is updated.
 func (c *tableCompaction) maybeSwitchToMoveOrCopy(
-	preferSharedStorage bool, provider objstorage.Provider,
+	opts *Options, preferSharedStorage bool, provider objstorage.Provider,
 ) {
 	// Only non-multi-level compactions with a single input file can be
 	// considered.
@@ -710,6 +719,35 @@ func (c *tableCompaction) maybeSwitchToMoveOrCopy(
 
 	iter := c.startLevel.files.Iter()
 	meta := iter.First()
+
+	if opts != nil && (opts.CompactionPropertyCollectorName != "" || opts.IsFileDue != nil) {
+		// Note: refusing the move when properties are not yet loaded blocks trivial
+		// moves after a restart until the background table-stats job catches up.
+		props, propsOK := meta.TableBacking.Properties()
+		if !propsOK {
+			return
+		}
+		var summary []byte
+		if opts.CompactionPropertyCollectorName != "" {
+			var hasSummary bool
+			summary, hasSummary = props.BlockPropertySummary()
+			if !hasSummary {
+				return
+			}
+		}
+		if opts.IsFileDue != nil {
+			if opts.IsFileDue(base.DueFileInfo{
+				Summary:      summary,
+				Bounds:       meta.UserKeyBounds(),
+				NumEntries:   meta.ScaleStatistic(props.NumEntries),
+				CreationTime: meta.CreationTime,
+				Size:         meta.Size,
+				Level:        c.startLevel.level,
+			}) {
+				return
+			}
+		}
+	}
 
 	// We should always be passed a provider, except in some unit tests.
 	isRemote := provider != nil && !objstorage.IsLocalTable(provider, meta.TableBacking.DiskFileNum)
@@ -1950,6 +1988,17 @@ func (d *DB) maybeTransitionSnapshotsToFileOnlyLocked() {
 	}
 }
 
+// MaybeScheduleCompaction checks if a background compaction is needed (such as
+// after an external repair watermark advances) and schedules it if so.
+func (d *DB) MaybeScheduleCompaction() {
+	if d.closed.Load() != nil || d.opts.ReadOnly {
+		return
+	}
+	d.mu.Lock()
+	d.maybeScheduleCompaction()
+	d.mu.Unlock()
+}
+
 // maybeScheduleCompactionAsync should be used when
 // we want to possibly schedule a compaction, but don't
 // want to eat the cost of running maybeScheduleCompaction.
@@ -2818,13 +2867,30 @@ func (d *DB) compactAndWrite(
 	if err != nil {
 		return compact.Result{Err: err}
 	}
+	isBottommost := c.isBottommostDataLayer()
+	var filter base.CompactionFilter
+	if !c.IsFlush() && d.opts.CompactionFilter != nil {
+		filter = d.opts.CompactionFilter(base.CompactionFilterInfo{
+			Bounds:                c.bounds,
+			OutputLevel:           c.outputLevel.level,
+			EventualOutputLevel:   c.eventualOutputLevel,
+			IsFlush:               false,
+			IsBottommostDataLayer: isBottommost,
+			HasOpenSnapshots:      len(snapshots) > 0,
+			Snapshots:             snapshots,
+			NewExternalIter: func() (base.InternalIterator, error) {
+				return d.newCompactionExternalIter(c)
+			},
+		})
+	}
 	cfg := compact.IterConfig{
 		Comparer:              c.comparer,
 		Merge:                 d.merge,
 		TombstoneElision:      c.delElision,
 		RangeKeyElision:       c.rangeKeyElision,
 		Snapshots:             snapshots,
-		IsBottommostDataLayer: c.isBottommostDataLayer(),
+		IsBottommostDataLayer: isBottommost,
+		Filter:                filter,
 		IneffectualSingleDeleteCallback: func(userKey []byte) {
 			d.opts.EventListener.PossibleAPIMisuse(PossibleAPIMisuseInfo{
 				Kind:    IneffectualSingleDelete,
@@ -2855,6 +2921,7 @@ func (d *DB) compactAndWrite(
 		MaxGrandparentOverlapBytes: c.maxOverlapBytes,
 		TargetOutputFileSize:       c.maxOutputFileSize,
 		GrantHandle:                c.grantHandle,
+		PartitionPrefix:            d.opts.PartitionPrefix,
 	}
 	runner := compact.NewRunner(runnerCfg, iter)
 
@@ -2880,6 +2947,9 @@ func (d *DB) compactAndWrite(
 			spanPolicySet = true
 		}
 		writerOpts := d.makeWriterOptions(c.eventualOutputLevel)
+		if c.IsFlush() && d.opts.CompactionPropertyCollectorName != "" {
+			writerOpts.BlockPropertyCollectors = d.opts.private.flushBlockPropertyCollectors
+		}
 		if spanPolicy.ValueStoragePolicy.DisableSeparationBySuffix {
 			writerOpts.DisableValueBlocks = true
 		}
@@ -2907,6 +2977,121 @@ func (d *DB) compactAndWrite(
 		result.Err = d.objProvider.Sync()
 	}
 	return result
+}
+
+type externalCompactionIter struct {
+	base.InternalIterator
+	rs           *readState
+	valueFetcher blob.ValueFetcher
+	closeCheck   invariants.CloseChecker
+}
+
+func (e *externalCompactionIter) Close() error {
+	e.closeCheck.Close()
+	var err error
+	if e.InternalIterator != nil {
+		err = e.InternalIterator.Close()
+	}
+	err = errors.CombineErrors(err, e.valueFetcher.Close())
+	if e.rs != nil {
+		e.rs.unref()
+		e.rs = nil
+	}
+	return err
+}
+
+func (d *DB) newCompactionExternalIter(c *tableCompaction) (base.InternalIterator, error) {
+	rs := d.loadReadState()
+	inputTables := make(map[base.TableNum]struct{})
+	for _, cl := range c.inputs {
+		for f := range cl.files.All() {
+			inputTables[f.TableNum] = struct{}{}
+		}
+	}
+
+	extIter := &externalCompactionIter{
+		rs: rs,
+	}
+	blockReadEnv := block.ReadEnv{
+		Stats: &c.metrics.internalIterStats,
+		IterStats: d.fileCache.SSTStatsCollector().Accumulator(
+			uint64(uintptr(unsafe.Pointer(extIter))),
+			categoryCompaction,
+		),
+		ValueRetrievalProfile: d.valueRetrievalProfile.Load(),
+	}
+	if rs.current != nil {
+		extIter.valueFetcher.Init(&rs.current.BlobFiles, d.fileCache, blockReadEnv, 1)
+	}
+	// Do not set compaction: true here: the external iterator is used for random
+	// point/prefix lookups via SeekPrefixGE and must consult SSTable Bloom filters
+	// rather than using compaction sequential readahead.
+	iiopts := internalIterOpts{
+		readEnv:          sstable.ReadEnv{Block: blockReadEnv},
+		blobValueFetcher: &extIter.valueFetcher,
+	}
+	iterOpts := IterOptions{
+		Category:     categoryCompaction,
+		logger:       c.logger,
+		UseL6Filters: true,
+	}
+
+	var iters []internalIterator
+	for i := len(rs.memtables) - 1; i >= 0; i-- {
+		mem := rs.memtables[i]
+		if fi, ok := mem.flushable.(*ingestedFlushable); ok {
+			iters = append(iters, fi.newIterInternal(&iterOpts, iiopts))
+		} else {
+			iters = append(iters, mem.newIter(&iterOpts))
+		}
+	}
+
+	ctx := context.Background()
+	addSlice := func(ls manifest.LevelSlice, layer manifest.Layer) {
+		if ls.Empty() {
+			return
+		}
+		hasInput := false
+		for f := range ls.All() {
+			if _, ok := inputTables[f.TableNum]; ok {
+				hasInput = true
+				break
+			}
+		}
+		if hasInput {
+			var remaining []*manifest.TableMetadata
+			for f := range ls.All() {
+				if _, ok := inputTables[f.TableNum]; !ok {
+					remaining = append(remaining, f)
+				}
+			}
+			if len(remaining) == 0 {
+				return
+			}
+			ls = manifest.NewLevelSliceKeySorted(c.comparer.Compare, remaining)
+		}
+		iters = append(iters, newLevelIter(ctx, iterOpts, c.comparer, d.newIters, ls.Iter(), layer, iiopts))
+	}
+
+	if rs.current != nil {
+		for idx := len(rs.current.L0SublevelFiles) - 1; idx >= 0; idx-- {
+			addSlice(rs.current.L0SublevelFiles[idx], manifest.L0Sublevel(idx))
+		}
+		maxLevel := len(rs.current.Levels)
+		if c.startLevel != nil && c.startLevel.level > 0 && c.startLevel.level < maxLevel {
+			// Include levels up to and including startLevel (excluding compaction inputs).
+			// Levels below startLevel for a bottommost compaction are empty in range.
+			maxLevel = c.startLevel.level + 1
+		}
+		for level := 1; level < maxLevel; level++ {
+			addSlice(rs.current.Levels[level].Slice(), manifest.Level(level))
+		}
+	}
+
+	extIter.InternalIterator = newMergingIter(
+		c.logger, &c.metrics.internalIterStats, c.comparer.Compare, c.comparer.Split, iters...,
+	)
+	return extIter, nil
 }
 
 // makeVersionEdit creates the version edit for a compaction, based on the
@@ -2994,7 +3179,7 @@ func (c *tableCompaction) makeVersionEdit(result compact.Result) (*manifest.Vers
 
 		// If the file didn't contain any range deletions, we can fill its
 		// table stats now, avoiding unnecessarily loading the table later.
-		maybeSetStatsFromProperties(fileMeta.PhysicalMeta(), &t.WriterMeta.Properties)
+		maybeSetStatsFromProperties(fileMeta.PhysicalMeta(), &t.WriterMeta.Properties, c.compactionPropertyCollectorName)
 
 		if t.WriterMeta.HasPointKeys {
 			fileMeta.ExtendPointKeyBounds(c.comparer.Compare,

@@ -204,6 +204,9 @@ type Iter struct {
 	// unsafe, i.iter-owned slice that could be altered when the iterator is
 	// advanced.
 	valueBuf []byte
+	// Temporary buffer used for storing replacement values produced by a
+	// CompactionFilter.
+	filterBuf []byte
 	// valueFetcher is used by saveValue when Cloning InternalValues.
 	valueFetcher     base.LazyFetcher
 	iterKV           *base.InternalKV
@@ -291,6 +294,10 @@ type IterConfig struct {
 	// At the time of writing, flushes always set this to false (because flushes
 	// almost never form the bottommost layer of data).
 	IsBottommostDataLayer bool
+
+	// Filter is an optional compaction filter invoked on point records (SET,
+	// SETWITHDEL, and merged MERGE records) before they are emitted by Next.
+	Filter base.CompactionFilter
 
 	// IneffectualPointDeleteCallback is called if a SINGLEDEL is being elided
 	// without deleting a point set/merge. False positives are rare but possible
@@ -631,9 +638,19 @@ func (i *Iter) Next() *base.InternalKV {
 			// entry. setNext() does the work to move the iterator forward,
 			// preserving the original value, and potentially mutating the key
 			// kind.
+			origSnapshotIdx := i.curSnapshotIdx
 			i.setNext()
 			if i.err != nil {
 				return nil
+			}
+			if i.cfg.Filter != nil {
+				keep := i.applyFilter(origSnapshotIdx)
+				if i.err != nil {
+					return nil
+				}
+				if !keep {
+					continue
+				}
 			}
 			return &i.kv
 
@@ -680,10 +697,25 @@ func (i *Iter) Next() *base.InternalKV {
 			}
 			if i.err == nil {
 				if needDelete {
+					// NB: In stock Pebble, if mergeNext stopped on an older SET or DEL
+					// in the same stripe (leaving i.pos == iterPosCurForward && i.skip),
+					// this bare continue re-enters the loop positioned at that older
+					// record rather than calling i.skipInStripe() (unlike
+					// CompactionFilterDrop in applyFilter). We preserve stock Pebble's
+					// exact behavior here so DeletableValueMerger semantics are unchanged.
 					if i.closeValueCloser() != nil {
 						return nil
 					}
 					continue
+				}
+				if i.cfg.Filter != nil {
+					keep := i.applyFilter(origSnapshotIdx)
+					if i.err != nil {
+						return nil
+					}
+					if !keep {
+						continue
+					}
 				}
 				return &i.kv
 			}
@@ -1430,7 +1462,71 @@ func (i *Iter) Close() error {
 		i.valueCloser = nil
 	}
 
+	if i.cfg.Filter != nil {
+		i.err = errors.CombineErrors(i.err, i.cfg.Filter.Close())
+	}
+
 	return i.err
+}
+
+func (i *Iter) applyFilter(snapshotIdx int) (keep bool) {
+	var val []byte
+	if i.kv.V.IsInPlaceValue() {
+		val = i.kv.V.InPlaceValue()
+	} else {
+		// Fetch into i.filterBuf rather than i.valueBuf because setNext ->
+		// saveValue stores the cloned LazyValue handle inside i.valueBuf.
+		// Overwriting i.valueBuf would corrupt the blob reference if the filter
+		// returns CompactionFilterKeep.
+		var callerOwned bool
+		val, callerOwned, i.err = i.kv.Value(i.filterBuf[:0])
+		if i.err != nil {
+			return false
+		}
+		if callerOwned && cap(val) > cap(i.filterBuf) {
+			i.filterBuf = val
+		}
+	}
+	info := base.CompactionFilterRecordInfo{
+		Kind:                  i.kv.K.Kind(),
+		SeqNum:                i.keyTrailer.SeqNum(),
+		StripeIndex:           snapshotIdx,
+		HasOpenSnapshots:      len(i.cfg.Snapshots) > 0,
+		IsBottommostDataLayer: i.cfg.IsBottommostDataLayer,
+		IsBottommostStripe:    i.isBottommostSnapshotStripe(snapshotIdx),
+		NothingOlderBelow:     snapshotIdx == 0 && (i.cfg.IsBottommostDataLayer || i.delElider.ShouldElide(i.kv.K.UserKey)),
+	}
+	decision, newVal, err := i.cfg.Filter.Filter(i.kv.K.UserKey, val, info)
+	if err != nil {
+		i.err = err
+		return false
+	}
+	switch decision {
+	case base.CompactionFilterKeep:
+		return true
+	case base.CompactionFilterReplace:
+		if i.closeValueCloser() != nil {
+			return false
+		}
+		i.filterBuf = append(i.filterBuf[:0], newVal...)
+		i.kv.V = base.MakeInPlaceValue(i.filterBuf)
+		return true
+	case base.CompactionFilterDrop:
+		if i.closeValueCloser() != nil {
+			return false
+		}
+		if i.pos == iterPosCurForward && i.skip {
+			i.skipInStripe()
+			if i.err != nil {
+				return false
+			}
+		} else {
+			i.pos = iterPosCurForward
+		}
+		return false
+	default:
+		panic(errors.AssertionFailedf("unexpected CompactionFilterDecision: %d", errors.Safe(decision)))
+	}
 }
 
 // cover is returned by tombstoneCovers and describes a span's relationship to

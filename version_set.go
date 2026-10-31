@@ -808,6 +808,9 @@ func (vs *versionSet) incrementCompactions(
 	case compactionKindVirtualRewrite:
 		vs.metrics.Compact.VirtualRewriteCount++
 
+	case compactionKindFilter:
+		vs.metrics.Compact.FilterCount++
+
 	default:
 		if invariants.Enabled {
 			panic(errors.AssertionFailedf("unhandled compaction kind"))

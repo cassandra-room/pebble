@@ -457,6 +457,25 @@ type TableBackingProperties struct {
 	// value separation rules by KV suffix when writing the table. Note that
 	// if value separation was disabled, this field is not meaningful.
 	ValueSeparationBySuffixDisabled bool
+
+	// HasCompactionPropertySummary is true if the configured
+	// CompactionPropertyCollectorName recorded a property on this table.
+	HasCompactionPropertySummary bool
+
+	// CompactionPropertySummary holds the table-level summary bytes recorded by
+	// the configured CompactionPropertyCollectorName (with Pebble's 1-byte
+	// shortID prefix removed).
+	CompactionPropertySummary []byte
+}
+
+// BlockPropertySummary returns the table-level summary bytes recorded by the
+// configured compaction property collector (with Pebble's 1-byte shortID prefix
+// removed), and whether the summary was present on the table.
+func (p *TableBackingProperties) BlockPropertySummary() ([]byte, bool) {
+	if p == nil || !p.HasCompactionPropertySummary {
+		return nil, false
+	}
+	return p.CompactionPropertySummary, true
 }
 
 // NumPointDeletions is the number of point deletions in the sstable. For virtual
@@ -477,8 +496,12 @@ func (b *TableBacking) Properties() (_ *TableBackingProperties, ok bool) {
 }
 
 // PopulateProperties populates the table stats. Can be called at most once for a
-// TableBacking.
-func (b *TableBacking) PopulateProperties(props *sstable.Properties) *TableBackingProperties {
+// TableBacking. If collectorName is non-empty and present in
+// props.UserProperties, its summary (with Pebble's 1-byte shortID prefix
+// stripped) is stored before publishing the properties.
+func (b *TableBacking) PopulateProperties(
+	props *sstable.Properties, collectorName string,
+) *TableBackingProperties {
 	b.props = TableBackingProperties{
 		NumEntries:                      props.NumEntries,
 		RawKeySize:                      props.RawKeySize,
@@ -496,6 +519,14 @@ func (b *TableBacking) PopulateProperties(props *sstable.Properties) *TableBacki
 	}
 	if props.NumDataBlocks != 0 {
 		b.props.TombstoneDenseBlocksRatio = float64(props.NumTombstoneDenseBlocks) / float64(props.NumDataBlocks)
+	}
+	if collectorName != "" && len(props.UserProperties) > 0 {
+		if val, ok := props.UserProperties[collectorName]; ok {
+			b.props.HasCompactionPropertySummary = true
+			if len(val) > 1 {
+				b.props.CompactionPropertySummary = []byte(val[1:])
+			}
+		}
 	}
 	var err error
 	// TODO(radu): store block.CompressionStats directly in props, to avoid having

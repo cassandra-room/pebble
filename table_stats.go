@@ -360,7 +360,7 @@ func (d *DB) loadTableStats(
 					if err != nil {
 						return err
 					}
-					backingProps = meta.TableBacking.PopulateProperties(&loadedProps)
+					backingProps = meta.TableBacking.PopulateProperties(&loadedProps, d.opts.CompactionPropertyCollectorName)
 				}
 				if backingProps.NumRangeDeletions > 0 || backingProps.NumRangeKeyDels > 0 {
 					wideTombstones, rangeDeletionsBytesEstimate, err = d.loadTableRangeDelStats(ctx, r, v, level, meta, env)
@@ -592,7 +592,7 @@ func (d *DB) estimateSizesBeneath(
 					// It is ok to call PopulateProperties here because this function runs as part of
 					// a table statistics job, and at most one goroutine runs this at a
 					// time (see d.mu.tableStats.loading).
-					backingProps = tableBeneath.TableBacking.PopulateProperties(&loadedProps)
+					backingProps = tableBeneath.TableBacking.PopulateProperties(&loadedProps, d.opts.CompactionPropertyCollectorName)
 					return nil
 				})
 				if err != nil {
@@ -823,8 +823,10 @@ func estimateDiskUsageInTableAndBlobReferences(
 // maybeSetStatsFromProperties sets the table backing properties and attempts to
 // set the table stats from the properties, for a table that was created by an
 // ingestion or compaction.
-func maybeSetStatsFromProperties(meta *manifest.TableMetadata, props *sstable.Properties) bool {
-	meta.TableBacking.PopulateProperties(props)
+func maybeSetStatsFromProperties(
+	meta *manifest.TableMetadata, props *sstable.Properties, collectorName string,
+) bool {
+	meta.TableBacking.PopulateProperties(props, collectorName)
 	if invariants.Enabled && meta.Virtual {
 		panic(errors.AssertionFailedf("table expected to be physical"))
 	}

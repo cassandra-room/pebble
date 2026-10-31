@@ -60,6 +60,21 @@ type (
 	TieringAttribute             = base.TieringAttribute
 	TieringPolicyAndExtractor    = base.TieringPolicyAndExtractor
 	UserKeyBounds                = base.UserKeyBounds
+
+	CompactionFilterDecision   = base.CompactionFilterDecision
+	CompactionFilterRecordInfo = base.CompactionFilterRecordInfo
+	CompactionFilter           = base.CompactionFilter
+	CompactionFilterInfo       = base.CompactionFilterInfo
+	CompactionFilterFactory    = base.CompactionFilterFactory
+	PartitionPrefixFunc        = base.PartitionPrefixFunc
+	DueFileInfo                = base.DueFileInfo
+	IsFileDueFunc              = base.IsFileDueFunc
+)
+
+const (
+	CompactionFilterKeep    = base.CompactionFilterKeep
+	CompactionFilterReplace = base.CompactionFilterReplace
+	CompactionFilterDrop    = base.CompactionFilterDrop
 )
 
 type (
@@ -1159,6 +1174,28 @@ type Options struct {
 	// built and lives for the lifetime of writing that table.
 	BlockPropertyCollectors []func() BlockPropertyCollector
 
+	// CompactionFilter holds a factory called once at the start of each
+	// compaction (never for flushes) to return a CompactionFilter for that
+	// compaction, or nil.
+	CompactionFilter CompactionFilterFactory
+
+	// PartitionPrefix returns the byte length of a user key's partition prefix.
+	// When set, output files of flushes and compactions are split only between
+	// partitions.
+	PartitionPrefix PartitionPrefixFunc
+
+	// CompactionPropertyCollectorName names the BlockPropertyCollector whose
+	// table-level summary is used to track due deletions. When non-empty:
+	// - this collector is omitted during flushes,
+	// - its summary (without Pebble's 1-byte shortID prefix) is copied into
+	//   in-memory TableBackingProperties, and
+	// - trivial moves are refused for files lacking its summary.
+	CompactionPropertyCollectorName string
+
+	// IsFileDue is consulted by the compaction picker and trivial-move check
+	// to determine whether a file's recorded deletions are due for compaction.
+	IsFileDue IsFileDueFunc
+
 	// WALBytesPerSync sets the number of bytes to write to a WAL before calling
 	// Sync on it in the background. Just like with BytesPerSync above, this
 	// helps smooth out disk write latencies, and avoids cases where the OS
@@ -1287,6 +1324,12 @@ type Options struct {
 		// against the FS are made after the DB is closed, the FS may leak a
 		// goroutine indefinitely.
 		fsCloser io.Closer
+
+		// flushBlockPropertyCollectors holds BlockPropertyCollectors with the
+		// collector matching CompactionPropertyCollectorName removed, computed
+		// once in EnsureDefaults so flushes don't instantiate collectors per
+		// output table.
+		flushBlockPropertyCollectors []func() BlockPropertyCollector
 	}
 }
 
@@ -1837,6 +1880,17 @@ func (o *Options) EnsureDefaults() {
 	}
 	if o.private.timeNow == nil {
 		o.private.timeNow = time.Now
+	}
+	o.private.flushBlockPropertyCollectors = nil
+	if o.CompactionPropertyCollectorName != "" && len(o.BlockPropertyCollectors) > 0 {
+		filtered := make([]func() BlockPropertyCollector, 0, len(o.BlockPropertyCollectors))
+		for _, fn := range o.BlockPropertyCollectors {
+			if col := fn(); col != nil && col.Name() == o.CompactionPropertyCollectorName {
+				continue
+			}
+			filtered = append(filtered, fn)
+		}
+		o.private.flushBlockPropertyCollectors = filtered
 	}
 }
 

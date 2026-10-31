@@ -31,7 +31,7 @@ func makeTestTableMeta(
 	m.TableBacking.PopulateProperties(&sstable.Properties{
 		ValueSeparationMinSize:          valSepMinSize,
 		ValueSeparationBySuffixDisabled: valSepBySuffixDisabled,
-	})
+	}, "")
 	return m
 }
 

@@ -73,6 +73,8 @@ func TestOptionsRoundtrip(t *testing.T) {
 		"CompactionScheduler",
 		// Function pointers
 		"BlockPropertyCollectors:",
+		"CompactionFilter:",
+		"PartitionPrefix:",
 		"EventListener:",
 		"CompactionConcurrencyRange:",
 		"MaxConcurrentDownloads:",

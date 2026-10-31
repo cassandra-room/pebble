@@ -3371,7 +3371,7 @@ func TestTombstoneDensityCompactionMoveOptimization(t *testing.T) {
 		NumDeletions:            8,
 		NumDataBlocks:           100,
 		NumTombstoneDenseBlocks: 90, // Above threshold
-	})
+	}, "")
 	meta.PopulateStats(&manifest.TableStats{})
 	meta.ExtendPointKeyBounds(opts.Comparer.Compare,
 		base.ParseInternalKey("a#1,SET"),
@@ -3475,7 +3475,7 @@ func TestTombstoneDensityCompactionMoveOptimization_NoMoveWithOverlap(t *testing
 
 		NumDataBlocks:           100,
 		NumTombstoneDenseBlocks: 90, // Above threshold
-	})
+	}, "")
 	metaL4.PopulateStats(&manifest.TableStats{})
 	metaL4.ExtendPointKeyBounds(opts.Comparer.Compare,
 		base.ParseInternalKey("a#1,SET"),
@@ -3560,7 +3560,7 @@ func TestTombstoneDensityCompactionMoveOptimization_GrandparentOverlapTooLarge(t
 
 		NumDataBlocks:           100,
 		NumTombstoneDenseBlocks: 90,
-	})
+	}, "")
 	metaL4.PopulateStats(&manifest.TableStats{})
 	metaL4.ExtendPointKeyBounds(opts.Comparer.Compare,
 		base.ParseInternalKey("a#1,SET"),
@@ -3577,7 +3577,7 @@ func TestTombstoneDensityCompactionMoveOptimization_GrandparentOverlapTooLarge(t
 		base.ParseInternalKey("z#3,SET"),
 	)
 	metaL6.InitPhysicalBacking()
-	metaL6.TableBacking.PopulateProperties(&sstable.Properties{})
+	metaL6.TableBacking.PopulateProperties(&sstable.Properties{}, "")
 	metaL6.PopulateStats(&manifest.TableStats{})
 
 	var files [numLevels][]*manifest.TableMetadata
@@ -3628,7 +3628,7 @@ func TestTombstoneDensityCompactionMoveOptimization_BelowDensityThreshold(t *tes
 
 		NumDataBlocks:           100,
 		NumTombstoneDenseBlocks: 50, // Below threshold
-	})
+	}, "")
 	meta.PopulateStats(&manifest.TableStats{})
 	meta.ExtendPointKeyBounds(opts.Comparer.Compare,
 		base.ParseInternalKey("a#1,SET"),

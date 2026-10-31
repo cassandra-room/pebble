@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/stretchr/testify/require"
 )
 
@@ -198,9 +199,45 @@ func TestTableMetadataSize(t *testing.T) {
 			structSize, tableMetadataSize)
 	}
 
-	const tableBackingSize = 176
+	const tableBackingSize = 200
 	if structSize := unsafe.Sizeof(TableBacking{}); structSize != tableBackingSize {
 		t.Errorf("TableBacking struct size (%d bytes) is not expected size (%d bytes)",
 			structSize, tableBackingSize)
 	}
+}
+
+func TestTableBackingBlockPropertySummary(t *testing.T) {
+	m := &TableMetadata{TableNum: 1}
+	m.InitPhysicalBacking()
+	rawProps := &sstable.Properties{
+		NumEntries: 42,
+		UserProperties: map[string]string{
+			"my-collector": string([]byte{0x03, 'a', 'b', 'c'}),
+			"empty-prop":   string([]byte{0x01}),
+		},
+	}
+	m.TableBacking.PopulateProperties(rawProps, "my-collector")
+	props, ok := m.TableBacking.Properties()
+	require.True(t, ok)
+
+	summary, has := props.BlockPropertySummary()
+	require.True(t, has)
+	require.Equal(t, []byte("abc"), summary)
+
+	m2 := &TableMetadata{TableNum: 2}
+	m2.InitPhysicalBacking()
+	m2.TableBacking.PopulateProperties(rawProps, "empty-prop")
+	props2, ok := m2.TableBacking.Properties()
+	require.True(t, ok)
+	emptySummary, hasEmpty := props2.BlockPropertySummary()
+	require.True(t, hasEmpty)
+	require.Nil(t, emptySummary)
+
+	m3 := &TableMetadata{TableNum: 3}
+	m3.InitPhysicalBacking()
+	m3.TableBacking.PopulateProperties(rawProps, "missing")
+	props3, ok := m3.TableBacking.Properties()
+	require.True(t, ok)
+	_, hasMissing := props3.BlockPropertySummary()
+	require.False(t, hasMissing)
 }

@@ -143,6 +143,8 @@ func init() {
 		compactionOptionalAndPriority{optional: true, priority: 60}
 	scheduledCompactionMap[compactionKindElisionOnly] =
 		compactionOptionalAndPriority{optional: true, priority: 50}
+	scheduledCompactionMap[compactionKindFilter] =
+		compactionOptionalAndPriority{optional: true, priority: 45}
 	scheduledCompactionMap[compactionKindVirtualRewrite] =
 		compactionOptionalAndPriority{optional: true, priority: 40}
 	scheduledCompactionMap[compactionKindBlobFileRewrite] =

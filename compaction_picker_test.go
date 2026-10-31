@@ -169,7 +169,7 @@ func parseTableMeta(t *testing.T, s string, opts *Options) (*manifest.TableMetad
 			}
 			m.TableBacking.PopulateProperties(&sstable.Properties{
 				NumDeletions: 1, // At least one range del responsible for the deletion bytes.
-			})
+			}, "")
 			m.PopulateStats(&manifest.TableStats{
 				RangeDeletionsBytesEstimate: uint64(v),
 			})
