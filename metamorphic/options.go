@@ -171,6 +171,16 @@ func parseOptions(
 				opts.disableDownloads = true
 			case "TestOptions.use_jemalloc_size_classes":
 				opts.Opts.AllocatorSizeClasses = pebble.JemallocSizeClasses
+			case "TestOptions.noop_compaction_filter":
+				opts.noopCompactionFilter = true
+				opts.Opts.CompactionFilter = func(pebble.CompactionFilterInfo) pebble.CompactionFilter {
+					return noopFilter{}
+				}
+			case "TestOptions.use_partition_prefix":
+				opts.usePartitionPrefix = true
+				opts.Opts.PartitionPrefix = func(key []byte) int {
+					return min(2, opts.Opts.Comparer.Split(key))
+				}
 			default:
 				if customOptionParsers == nil {
 					return
@@ -269,6 +279,12 @@ func optionsToString(opts *TestOptions) string {
 	}
 	if opts.disableDownloads {
 		fmt.Fprintf(&buf, "  disable_downloads=%v\n", opts.disableDownloads)
+	}
+	if opts.noopCompactionFilter {
+		fmt.Fprintf(&buf, "  noop_compaction_filter=%v\n", opts.noopCompactionFilter)
+	}
+	if opts.usePartitionPrefix {
+		fmt.Fprintf(&buf, "  use_partition_prefix=%v\n", opts.usePartitionPrefix)
 	}
 	if opts.Opts.AllocatorSizeClasses != nil {
 		if fmt.Sprint(opts.Opts.AllocatorSizeClasses) != fmt.Sprint(pebble.JemallocSizeClasses) {
@@ -436,9 +452,24 @@ type TestOptions struct {
 	useDeleteOnlyCompactionExcises bool
 	// disableDownloads, if true, makes downloadOp a no-op.
 	disableDownloads bool
+	// noopCompactionFilter configures a no-op CompactionFilter.
+	noopCompactionFilter bool
+	// usePartitionPrefix configures PartitionPrefix using a 2-byte prefix of
+	// Comparer.Split so multiple distinct user keys share a partition.
+	usePartitionPrefix bool
 	// treeSteps enables treesteps visualizations for each iterator operation.
 	treeSteps bool
 }
+
+type noopFilter struct{}
+
+func (noopFilter) Filter(
+	key, value []byte, info pebble.CompactionFilterRecordInfo,
+) (pebble.CompactionFilterDecision, []byte, error) {
+	return pebble.CompactionFilterKeep, nil, nil
+}
+
+func (noopFilter) Close() error { return nil }
 
 // CustomOption defines a custom option that configures the behavior of an
 // individual test run. Like all test options, custom options are serialized to
@@ -607,6 +638,11 @@ enabled = false
 		30: `
 [Options]
   iterator_stack=v2
+`,
+		31: `
+[TestOptions]
+  noop_compaction_filter=true
+  use_partition_prefix=true
 `,
 	}
 
@@ -945,6 +981,18 @@ func RandomOptions(rng *rand.Rand, kf KeyFormat, cfg RandomOptionsCfg) *TestOpti
 		return testOpts.useDeleteOnlyCompactionExcises
 	}
 	testOpts.disableDownloads = rng.IntN(2) == 0
+	if rng.IntN(2) == 0 {
+		testOpts.noopCompactionFilter = true
+		opts.CompactionFilter = func(pebble.CompactionFilterInfo) pebble.CompactionFilter {
+			return noopFilter{}
+		}
+	}
+	if rng.IntN(2) == 0 {
+		testOpts.usePartitionPrefix = true
+		opts.PartitionPrefix = func(key []byte) int {
+			return min(2, opts.Comparer.Split(key))
+		}
+	}
 	testOpts.Opts.EnsureDefaults()
 	return testOpts
 }

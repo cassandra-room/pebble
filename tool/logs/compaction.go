@@ -322,6 +322,7 @@ const (
 	compactionTypeRewrite
 	compactionTypeBlobRewrite
 	compactionTypeVirtualRewrite
+	compactionTypeFilter
 )
 
 // String implements fmt.Stringer.
@@ -347,6 +348,8 @@ func (c compactionType) String() string {
 		return "blob-rewrite"
 	case compactionTypeVirtualRewrite:
 		return "virtual-sst-rewrite"
+	case compactionTypeFilter:
+		return "filter"
 	default:
 		panic(errors.Newf("unknown compaction type: %s", c))
 	}
@@ -376,6 +379,8 @@ func parseCompactionType(s string) (t compactionType, err error) {
 		t = compactionTypeBlobRewrite
 	case "virtual-sst-rewrite":
 		t = compactionTypeVirtualRewrite
+	case "filter":
+		t = compactionTypeFilter
 	default:
 		err = errors.Newf("unknown compaction type: %s", s)
 	}
@@ -424,9 +429,10 @@ func parseCompactionStart(matches []string) (compactionStart, error) {
 		return start, errors.Newf("could not parse from-level: %s", err)
 	}
 
-	// Parse to-level. For deletion and elision compactions, set the same level.
+	// Parse to-level. For deletion, elision, and single-level filter compactions, set the same level.
 	to := from
-	if cType != compactionTypeElisionOnly && cType != compactionTypeDeleteOnly {
+	if cType != compactionTypeElisionOnly && cType != compactionTypeDeleteOnly &&
+		(cType != compactionTypeFilter || matches[compactionPatternToIdx] != "") {
 		to, err = strconv.Atoi(matches[compactionPatternToIdx])
 		if err != nil {
 			return start, errors.Newf("could not parse to-level: %s", err)

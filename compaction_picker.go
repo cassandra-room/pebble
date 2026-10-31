@@ -1513,6 +1513,12 @@ func (p *compactionPickerByScore) pickAutoNonScore(env compactionEnv) (pc picked
 		return pc
 	}
 
+	// Check for files with application-level deletions or expiring items that
+	// are now due for compaction-filter cleanup.
+	if pc := p.pickDueCompaction(env); pc != nil {
+		return pc
+	}
+
 	// Check for virtual SST rewrites. These compactions materialize virtual tables
 	// to reclaim space in backing files with low utilization.
 	if pc := p.pickVirtualRewriteCompaction(env); pc != nil {
@@ -1698,6 +1704,99 @@ func (p *compactionPickerByScore) pickElisionOnlyCompaction(
 		return nil
 	}
 	return p.pickedCompactionFromCandidateFile(candidate, env, numLevels-1, numLevels-1, compactionKindElisionOnly)
+}
+
+// pickDueCompaction looks for files whose block-property summary (or file
+// metadata) indicates they are due for compaction-filter cleanup. Because
+// bottommost purging requires no open snapshots, nothing is picked while any
+// snapshot is open.
+//
+// Because external watermarks (and wall-clock age) advance outside Pebble,
+// eligibility is not cacheable in a B-Tree annotator and is evaluated by
+// scanning L6..L1 files. Only files whose compaction into the next level is the
+// bottommost data layer for its key range (no overlap two or more levels down)
+// are picked.
+func (p *compactionPickerByScore) pickDueCompaction(env compactionEnv) (pc *pickedTableCompaction) {
+	if p.opts.IsFileDue == nil {
+		return nil
+	}
+	if env.earliestSnapshotSeqNum < base.SeqNumMax {
+		return nil
+	}
+	for l := numLevels - 1; l >= 1; l-- {
+		if l < p.baseLevel {
+			continue
+		}
+		iter := p.vers.Levels[l].Iter()
+		for f := iter.First(); f != nil; f = iter.Next() {
+			if f.IsCompacting() || f.Size == 0 {
+				continue
+			}
+			props, propsValid := f.TableBacking.Properties()
+			if !propsValid {
+				continue
+			}
+			var summary []byte
+			if p.opts.CompactionPropertyCollectorName != "" {
+				var hasSummary bool
+				summary, hasSummary = props.BlockPropertySummary()
+				if !hasSummary {
+					continue
+				}
+			}
+			bounds := f.UserKeyBounds()
+			if !p.opts.IsFileDue(base.DueFileInfo{
+				Summary:      summary,
+				Bounds:       bounds,
+				NumEntries:   f.ScaleStatistic(props.NumEntries),
+				CreationTime: f.CreationTime,
+				Size:         f.Size,
+				Level:        l,
+			}) {
+				continue
+			}
+			outputLevel := numLevels - 1
+			if l < numLevels-1 {
+				outputLevel = defaultOutputLevel(l, p.baseLevel)
+				skip := false
+				for below := l + 2; below < numLevels; below++ {
+					if p.vers.HasOverlap(below, bounds) {
+						skip = true
+						break
+					}
+				}
+				if skip {
+					continue
+				}
+			}
+			pc := p.pickedCompactionFromCandidateFile(f, env, l, outputLevel, compactionKindFilter)
+			if pc == nil {
+				continue
+			}
+			// If l < L6, verify against the (possibly widened) pc.bounds that no
+			// level below outputLevel overlaps and no in-progress compaction outputs
+			// to a lower level within pc.bounds, so the compaction remains bottommost.
+			bottommost := true
+			for below := outputLevel + 1; below < numLevels; below++ {
+				if p.vers.HasOverlap(below, pc.bounds) {
+					bottommost = false
+					break
+				}
+			}
+			if bottommost && l < numLevels-1 {
+				for _, ic := range env.inProgressCompactions {
+					if ic.outputLevel > l && ic.bounds != nil && ic.bounds.Overlaps(p.opts.Comparer.Compare, pc.bounds) {
+						bottommost = false
+						break
+					}
+				}
+			}
+			if bottommost {
+				return pc
+			}
+		}
+	}
+	return nil
 }
 
 // pickRewriteCompaction attempts to construct a compaction that

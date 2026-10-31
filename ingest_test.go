@@ -259,7 +259,7 @@ func TestIngestLoadRand(t *testing.T) {
 				RawKeySize:    rawKeySize,
 				NumEntries:    count,
 				NumDataBlocks: 1,
-			})
+			}, "")
 		}()
 	}
 

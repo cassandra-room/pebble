@@ -1165,3 +1165,70 @@ next
 a#3,SET:<blobref(B000294, encodedHandle=020a, valLen=20)>
 b#9,SET:<fetched value from blobref(B000294, encodedHandle=0223, valLen=100)>mergekeyvalue[base]
 .
+
+# Verify that a CompactionFilter returning Keep on a blob reference preserves
+# the blob handle intact despite fetching the value for Filter().
+
+define
+a#9,SET:blobref(000294, blk2, 10, 20)
+b#3,SET:blobref(000294, blk2, 30, 5)
+----
+
+iter filter=keep
+first
+next
+next
+----
+a#9,SET:<blobref(B000294, encodedHandle=020a, valLen=20)>
+b#3,SET:<blobref(B000294, encodedHandle=021e, valLen=5)>
+.
+
+# Verify CompactionFilter Keep, Replace, and Drop decisions across MERGE chains,
+# bottommost vs non-bottommost layers, and snapshot stripes.
+
+define
+a#5,MERGE:dead
+b#5,MERGE::old
+b#2,MERGE:v1
+c#4,SET:keep
+----
+
+# Non-bottommost layer: MERGE-only chains stay MERGE (not converted to SET).
+iter is-bottommost-layer=false filter=(drop-bottommost:dead[base],replace::old[base]->:clean)
+first
+next
+next
+next
+----
+a#5,MERGE:dead
+b#5,MERGE:v1:old
+c#4,SET:keep
+.
+
+# Bottommost layer with no snapshots: MERGE chains convert to SET#0,
+# drop-bottommost drops 'a', and replace cleans 'b'.
+iter is-bottommost-layer=true filter=(drop-bottommost:dead[base],replace::old[base]->:clean)
+first
+next
+next
+----
+b#0,SET:v1:clean
+c#0,SET:keep
+.
+
+# Bottommost layer with open snapshot at seqnum 3:
+# HasOpenSnapshots is true so drop-bottommost does not drop 'a', and 'b' is split
+# across snapshot stripes (where replace cleans the newer stripe).
+iter is-bottommost-layer=true snapshots=3 filter=(drop-bottommost:dead[base],replace::old->:clean)
+first
+next
+next
+next
+next
+----
+a#5,MERGE:dead
+b#5,MERGE::clean
+b#0,SET:v1[base]
+c#4,SET:keep
+.
+

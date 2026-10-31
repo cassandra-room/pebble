@@ -135,3 +135,137 @@ func initTestFrontier(f *Frontiers, keys ...[]byte) *frontier {
 	ff.Init(f, key, reached)
 	return ff
 }
+
+func TestOutputSplitterWithPartitionPrefix(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
+	partitionPrefix := func(k []byte) int {
+		if idx := bytes.IndexByte(k, '/'); idx >= 0 {
+			return idx + 1
+		}
+		return len(k)
+	}
+	partitionStart := func(k []byte) []byte {
+		n := partitionPrefix(k)
+		if n <= 0 || n >= len(k) {
+			return k
+		}
+		return k[:n]
+	}
+
+	t.Run("size-split-waits-for-partition-boundary", func(t *testing.T) {
+		f := &Frontiers{cmp: cmp}
+		var gp manifest.LevelMetadata
+		s := NewOutputSplitterWithPartitionPrefix(
+			cmp, []byte("p1/a"), nil, 100, gp.Iter(), f, partitionPrefix,
+		)
+		var prevPrefix []byte
+		equalPrev := func(k []byte) bool {
+			return len(prevPrefix) > 0 && cmp(partitionStart(k), prevPrefix) == 0
+		}
+		keys := []struct {
+			key  string
+			size uint64
+			want bool
+		}{
+			{"p1/a", 0, false},
+			{"p1/b", 80, false},
+			// Exceeds targetFileSize (100), but still in partition "p1/".
+			{"p1/c", 150, false},
+			{"p1/d", 250, false},
+			// Next partition "p2/" -> splits at "p2/".
+			{"p2/a", 250, true},
+		}
+		for _, tc := range keys {
+			f.Advance([]byte(tc.key))
+			got := bool(s.ShouldSplitBefore([]byte(tc.key), tc.size, equalPrev))
+			if got != tc.want {
+				t.Fatalf("key %s: got split=%v, want %v", tc.key, got, tc.want)
+			}
+			if got {
+				if string(s.SplitKey()) != "p2/" {
+					t.Fatalf("got splitKey=%q, want %q", s.SplitKey(), "p2/")
+				}
+				break
+			}
+			prevPrefix = partitionStart([]byte(tc.key))
+		}
+	})
+
+	t.Run("grandparent-boundary-moved-to-partition-start", func(t *testing.T) {
+		var files [manifest.NumLevels][]*manifest.TableMetadata
+		// Grandparent 1 starts mid-partition at "p2/m", Grandparent 2 starts at "p3/b".
+		gp1, err := manifest.ParseTableMetadataDebug("000001:[p2/m#1,SET-p2/z#1,SET]")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gp2, err := manifest.ParseTableMetadataDebug("000002:[p3/b#1,SET-p3/z#1,SET]")
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[1] = []*manifest.TableMetadata{gp1, gp2}
+		l0Org := manifest.NewL0Organizer(base.DefaultComparer, 64*1024)
+		v := manifest.NewVersionForTesting(base.DefaultComparer, l0Org, files)
+		gp := v.Levels[1]
+
+		f := &Frontiers{cmp: cmp}
+		s := NewOutputSplitterWithPartitionPrefix(
+			cmp, []byte("p1/a"), nil, 100, gp.Iter(), f, partitionPrefix,
+		)
+		var prevPrefix []byte
+		equalPrev := func(k []byte) bool {
+			return len(prevPrefix) > 0 && cmp(partitionStart(k), prevPrefix) == 0
+		}
+
+		// At 60 bytes (>= 50% of 100), reaching "p2/a" triggers the grandparent
+		// frontier that was moved from "p2/m" to "p2/".
+		steps := []struct {
+			key  string
+			size uint64
+			want bool
+		}{
+			{"p1/a", 0, false},
+			{"p1/b", 60, false},
+			{"p2/a", 60, true},
+		}
+		for _, tc := range steps {
+			f.Advance([]byte(tc.key))
+			got := bool(s.ShouldSplitBefore([]byte(tc.key), tc.size, equalPrev))
+			if got != tc.want {
+				t.Fatalf("key %s: got split=%v, want %v", tc.key, got, tc.want)
+			}
+			if got {
+				if string(s.SplitKey()) != "p2/" {
+					t.Fatalf("got splitKey=%q, want %q", s.SplitKey(), "p2/")
+				}
+				break
+			}
+			prevPrefix = partitionStart([]byte(tc.key))
+		}
+	})
+
+	t.Run("limit-moved-to-partition-start", func(t *testing.T) {
+		f := &Frontiers{cmp: cmp}
+		var gp manifest.LevelMetadata
+		// Limit is "p2/m", which moves back to "p2/".
+		s := NewOutputSplitterWithPartitionPrefix(
+			cmp, []byte("p1/a"), []byte("p2/m"), 1000, gp.Iter(), f, partitionPrefix,
+		)
+		var prevPrefix []byte
+		equalPrev := func(k []byte) bool {
+			return len(prevPrefix) > 0 && cmp(partitionStart(k), prevPrefix) == 0
+		}
+		f.Advance([]byte("p1/a"))
+		if s.ShouldSplitBefore([]byte("p1/a"), 0, equalPrev) {
+			t.Fatal("unexpected split at p1/a")
+		}
+		prevPrefix = partitionStart([]byte("p1/a"))
+
+		f.Advance([]byte("p2/a"))
+		if !s.ShouldSplitBefore([]byte("p2/a"), 10, equalPrev) {
+			t.Fatal("expected split at p2/a due to limit moved from p2/m to p2/")
+		}
+		if string(s.SplitKey()) != "p2/" {
+			t.Fatalf("got splitKey=%q, want %q", s.SplitKey(), "p2/")
+		}
+	})
+}

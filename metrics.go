@@ -402,6 +402,7 @@ type CompactMetrics struct {
 	MultiLevelCount       int64
 	BlobFileRewriteCount  int64
 	VirtualRewriteCount   int64
+	FilterCount           int64
 	// An estimate of the number of bytes that need to be compacted for the LSM
 	// to reach a stable state.
 	EstimatedDebt uint64

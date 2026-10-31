@@ -108,6 +108,10 @@ type RunnerConfig struct {
 	// GrantHandle is used to perform accounting of resource consumption by the
 	// CompactionScheduler.
 	GrantHandle base.CompactionGrantHandle
+
+	// PartitionPrefix, if non-nil, extracts the partition prefix from a user key
+	// so that compaction output tables only split at partition boundaries.
+	PartitionPrefix base.PartitionPrefixFunc
 }
 
 // Runner is a helper for running the "data" part of a compaction (where we use
@@ -242,6 +246,17 @@ func (r *Runner) WriteTable(
 	}
 }
 
+func (r *Runner) partitionStart(key []byte) []byte {
+	if r.cfg.PartitionPrefix == nil || len(key) == 0 {
+		return key
+	}
+	n := r.cfg.PartitionPrefix(key)
+	if n <= 0 || n >= len(key) {
+		return key
+	}
+	return key[:n]
+}
+
 func (r *Runner) writeKeysToTable(
 	tw sstable.RawWriter, limitKey []byte, valueSeparation valsep.ValueSeparation,
 ) (splitKey []byte, _ error) {
@@ -250,13 +265,36 @@ func (r *Runner) writeKeysToTable(
 	if firstKey == nil {
 		return nil, base.AssertionFailedf("no data to write")
 	}
+	partitionPrefix := r.cfg.PartitionPrefix
+	if len(limitKey) > 0 && partitionPrefix != nil {
+		cand := r.partitionStart(limitKey)
+		if r.cmp(cand, firstKey) > 0 {
+			limitKey = cand
+		} else {
+			// The caller's explicit limitKey (from SpanPolicy.KeyRange.End) falls
+			// within firstKey's partition. Honor the explicit span-policy boundary
+			// rather than dropping limitKey.
+			partitionPrefix = nil
+		}
+	}
 	limitKey = base.MinUserKey(r.cmp, limitKey, r.TableSplitLimit(firstKey))
-	splitter := NewOutputSplitter(
+	splitter := NewOutputSplitterWithPartitionPrefix(
 		r.cmp, firstKey, limitKey,
 		r.cfg.TargetOutputFileSize, r.cfg.Grandparents.Iter(), r.iter.Frontiers(),
+		partitionPrefix,
 	)
+	var prevPartitionPrefix []byte
+	if partitionPrefix != nil {
+		prevPartitionPrefix = append(prevPartitionPrefix[:0], r.partitionStart(firstKey)...)
+	}
 	equalPrev := func(k []byte) bool {
-		return tw.ComparePrev(k) == 0
+		if tw.ComparePrev(k) == 0 {
+			return true
+		}
+		if partitionPrefix != nil {
+			return r.cmp(r.partitionStart(k), prevPartitionPrefix) == 0
+		}
+		return false
 	}
 	var pinnedKeySize, pinnedValueSize, pinnedCount uint64
 	var iteratedKeys uint64
@@ -274,6 +312,9 @@ func (r *Runner) writeKeysToTable(
 		outputSize += valueSeparation.EstimatedReferenceSize()
 		if splitter.ShouldSplitBefore(kv.K.UserKey, outputSize, equalPrev) {
 			break
+		}
+		if partitionPrefix != nil {
+			prevPartitionPrefix = append(prevPartitionPrefix[:0], r.partitionStart(kv.K.UserKey)...)
 		}
 
 		switch kv.K.Kind() {
@@ -387,18 +428,31 @@ func (r *Runner) TableSplitLimit(startKey []byte) []byte {
 	for ; f != nil; f = iter.Next() {
 		overlappedBytes += f.Size
 		if overlappedBytes > r.cfg.MaxGrandparentOverlapBytes {
-			limitKey = f.Smallest().UserKey
-			break
+			cand := r.partitionStart(f.Smallest().UserKey)
+			if r.cmp(cand, startKey) > 0 {
+				limitKey = cand
+				break
+			}
 		}
 	}
 
 	if len(r.cfg.L0SplitKeys) != 0 {
-		// Find the first split key that is greater than startKey.
-		index := sort.Search(len(r.cfg.L0SplitKeys), func(i int) bool {
-			return r.cmp(r.cfg.L0SplitKeys[i], startKey) > 0
-		})
-		if index < len(r.cfg.L0SplitKeys) {
-			limitKey = base.MinUserKey(r.cmp, limitKey, r.cfg.L0SplitKeys[index])
+		if r.cfg.PartitionPrefix == nil {
+			// Find the first split key that is greater than startKey.
+			index := sort.Search(len(r.cfg.L0SplitKeys), func(i int) bool {
+				return r.cmp(r.cfg.L0SplitKeys[i], startKey) > 0
+			})
+			if index < len(r.cfg.L0SplitKeys) {
+				limitKey = base.MinUserKey(r.cmp, limitKey, r.cfg.L0SplitKeys[index])
+			}
+		} else {
+			// Find the first split key whose partition start is greater than startKey.
+			index := sort.Search(len(r.cfg.L0SplitKeys), func(i int) bool {
+				return r.cmp(r.partitionStart(r.cfg.L0SplitKeys[i]), startKey) > 0
+			})
+			if index < len(r.cfg.L0SplitKeys) {
+				limitKey = base.MinUserKey(r.cmp, limitKey, r.partitionStart(r.cfg.L0SplitKeys[index]))
+			}
 		}
 	}
 

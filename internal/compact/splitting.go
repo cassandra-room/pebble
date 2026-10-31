@@ -95,11 +95,12 @@ func (s ShouldSplit) String() string {
 // The dominant cost of OutputSplitter is one key comparison per
 // ShouldSplitBefore call.
 type OutputSplitter struct {
-	cmp            base.Compare
-	startKey       []byte
-	limit          []byte
-	targetFileSize uint64
-	frontier       frontier
+	cmp             base.Compare
+	partitionPrefix base.PartitionPrefixFunc
+	startKey        []byte
+	limit           []byte
+	targetFileSize  uint64
+	frontier        frontier
 
 	shouldSplitCalled bool
 
@@ -121,6 +122,17 @@ type splitterBoundary struct {
 	isGrandparent bool
 }
 
+func (s *OutputSplitter) partitionStart(key []byte) []byte {
+	if s.partitionPrefix == nil || len(key) == 0 {
+		return key
+	}
+	n := s.partitionPrefix(key)
+	if n <= 0 || n >= len(key) {
+		return key
+	}
+	return key[:n]
+}
+
 // NewOutputSplitter creates a new OutputSplitter. See OutputSplitter for more
 // information.
 //
@@ -138,21 +150,45 @@ func NewOutputSplitter(
 	grandparentLevel manifest.LevelIterator,
 	frontiers *Frontiers,
 ) *OutputSplitter {
+	return NewOutputSplitterWithPartitionPrefix(
+		cmp, startKey, limit, targetFileSize, grandparentLevel, frontiers, nil,
+	)
+}
+
+// NewOutputSplitterWithPartitionPrefix creates a new OutputSplitter configured
+// with an optional partition-prefix function.
+func NewOutputSplitterWithPartitionPrefix(
+	cmp base.Compare,
+	startKey []byte,
+	limit []byte,
+	targetFileSize uint64,
+	grandparentLevel manifest.LevelIterator,
+	frontiers *Frontiers,
+	partitionPrefix base.PartitionPrefixFunc,
+) *OutputSplitter {
 	s := &OutputSplitter{
 		cmp:              cmp,
+		partitionPrefix:  partitionPrefix,
 		startKey:         slices.Clone(startKey),
 		targetFileSize:   targetFileSize,
 		grandparentLevel: grandparentLevel,
 	}
 	if len(limit) > 0 {
-		if invariants.Enabled && cmp(startKey, limit) >= 0 {
-			panic(errors.AssertionFailedf("limit <= startKey"))
+		if partitionPrefix != nil {
+			limitStart := s.partitionStart(limit)
+			if cmp(startKey, limitStart) < 0 {
+				s.limit = slices.Clone(limitStart)
+			}
+		} else {
+			if invariants.Enabled && cmp(startKey, limit) >= 0 {
+				panic(errors.AssertionFailedf("limit <= startKey"))
+			}
+			s.limit = slices.Clone(limit)
 		}
-		s.limit = slices.Clone(limit)
 	}
 	// Find the first grandparent that starts at or after startKey.
 	grandparent := s.grandparentLevel.SeekGE(cmp, startKey)
-	if grandparent != nil && cmp(grandparent.Smallest().UserKey, startKey) <= 0 {
+	for grandparent != nil && cmp(s.partitionStart(grandparent.Smallest().UserKey), startKey) <= 0 {
 		grandparent = s.grandparentLevel.Next()
 	}
 	s.setNextBoundary(grandparent)
@@ -181,16 +217,29 @@ func (s *OutputSplitter) boundaryReached(key []byte) (nextBoundary []byte) {
 }
 
 func (s *OutputSplitter) setNextBoundary(nextGrandparent *manifest.TableMetadata) {
-	if nextGrandparent != nil && (s.limit == nil || s.cmp(nextGrandparent.Smallest().UserKey, s.limit) < 0) {
-		s.nextBoundary = splitterBoundary{
-			key:           nextGrandparent.Smallest().UserKey,
-			isGrandparent: true,
+	if s.partitionPrefix != nil {
+		for nextGrandparent != nil {
+			gpStart := s.partitionStart(nextGrandparent.Smallest().UserKey)
+			if s.cmp(gpStart, s.startKey) > 0 &&
+				(s.reachedBoundary.key == nil || s.cmp(gpStart, s.reachedBoundary.key) > 0) {
+				break
+			}
+			nextGrandparent = s.grandparentLevel.Next()
 		}
-	} else {
-		s.nextBoundary = splitterBoundary{
-			key:           s.limit,
-			isGrandparent: false,
+	}
+	if nextGrandparent != nil {
+		gpKey := s.partitionStart(nextGrandparent.Smallest().UserKey)
+		if s.limit == nil || s.cmp(gpKey, s.limit) < 0 {
+			s.nextBoundary = splitterBoundary{
+				key:           gpKey,
+				isGrandparent: true,
+			}
+			return
 		}
+	}
+	s.nextBoundary = splitterBoundary{
+		key:           s.limit,
+		isGrandparent: false,
 	}
 }
 
@@ -245,8 +294,10 @@ func (s *OutputSplitter) ShouldSplitBefore(
 		// same UserKey as the previous key (otherwise, that key would have been the
 		// one hitting this boundary).
 		if reachedBoundary.isGrandparent {
-			s.splitKey = reachedBoundary.key
-			return SplitNow
+			if s.partitionPrefix == nil || (!equalPrevFn(nextUserKey) && s.cmp(reachedBoundary.key, s.startKey) > 0) {
+				s.splitKey = reachedBoundary.key
+				return SplitNow
+			}
 		}
 
 		// When the target file size limit is very small (in tests), we could end up
@@ -260,7 +311,11 @@ func (s *OutputSplitter) ShouldSplitBefore(
 		// user key that is different; the main difficulty is that various tests
 		// expect 1 key per output table if the target file size is very small.
 		if !equalPrevFn(nextUserKey) {
-			s.splitKey = slices.Clone(nextUserKey)
+			splitKey := s.partitionStart(nextUserKey)
+			if s.cmp(splitKey, s.startKey) <= 0 {
+				splitKey = nextUserKey
+			}
+			s.splitKey = slices.Clone(splitKey)
 			return SplitNow
 		}
 	}
